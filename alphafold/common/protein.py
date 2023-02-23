@@ -19,6 +19,13 @@ from typing import Any, Mapping, Optional
 from alphafold.common import residue_constants
 from Bio.PDB import PDBParser
 import numpy as np
+import modelcif
+import modelcif.model
+import modelcif.dumper
+import modelcif.reference
+import modelcif.protocol
+import modelcif.alignment
+import modelcif.qa_metric
 
 FeatureDict = Mapping[str, np.ndarray]
 ModelOutput = Mapping[str, Any]  # Is a nested dict.
@@ -223,6 +230,132 @@ def to_pdb(prot: Protein) -> str:
   return '\n'.join(pdb_lines) + '\n'  # Add terminating newline.
 
 
+def to_modelcif(prot: Protein) -> str:
+  """
+  Converts a `Protein` instance to a ModelCIF string.
+
+  Args:
+    prot: The protein to convert to PDB.
+
+  Returns:
+    ModelCIF string.
+  """
+
+  restypes = residue_constants.restypes + ["X"]
+  atom_types = residue_constants.atom_types
+
+  atom_mask = prot.atom_mask
+  aatype = prot.aatype
+  atom_positions = prot.atom_positions
+  residue_index = prot.residue_index.astype(np.int32)
+  b_factors = prot.b_factors
+  chain_index = prot.chain_index
+
+  n = aatype.shape[0]
+  if chain_index is None:
+    chain_index = [0 for i in range(n)]
+
+  system = modelcif.System(title='OpenFold prediction')
+
+  # Finding chains and creating entities
+  seqs = {}
+  seq = []
+  last_chain_idx = None
+  for i in range(n):
+    if last_chain_idx is not None and last_chain_idx != chain_index[i]:
+      seqs[last_chain_idx] = seq
+      seq = []
+    seq.append(restypes[aatype[i]])
+    last_chain_idx = chain_index[i]
+  # finally add the last chain
+  if last_chain_idx not in seqs:
+    seqs[last_chain_idx] = seq
+
+  # now reduce sequences to unique ones (note this won't work if different asyms have different unmodelled regions)
+  unique_seqs = {}
+  for chain_idx in seqs.keys():
+    seq = "".join(seqs[chain_idx])
+    if seq in unique_seqs:
+      unique_seqs[seq].append(chain_idx)
+    else:
+      unique_seqs[seq] = [chain_idx]
+
+  # adding 1 entity per unique sequence
+  entities_map = {}
+  for key, value in unique_seqs.items():
+    model_e = modelcif.Entity("".join(key), description='Model subunit')
+    for chain_idx in value:
+      entities_map[chain_idx] = model_e
+
+  asym_unit_map = {}
+  for chain_idx in set(chain_index):
+    # Define the model assembly
+    chain_id = PDB_CHAIN_IDS[chain_idx]
+    asym = modelcif.AsymUnit(entities_map[chain_idx], details='Model subunit %s' % chain_id, id=chain_id)
+    asym_unit_map[chain_idx] = asym
+  modeled_assembly = modelcif.Assembly(asym_unit_map.values(), name='Modeled assembly')
+
+  class _LocalPLDDT(modelcif.qa_metric.Local, modelcif.qa_metric.PLDDT):
+    name = "pLDDT"
+    software = None
+    description = "Predicted lddt"
+
+  class _GlobalPLDDT(modelcif.qa_metric.Global, modelcif.qa_metric.PLDDT):
+    name = "pLDDT"
+    software = None
+    description = "Global pLDDT, mean of per-residue pLDDTs"
+
+  class _MyModel(modelcif.model.AbInitioModel):
+    def get_atoms(self):
+      # Add all atom sites.
+      for i in range(n):
+        for atom_name, pos, mask, b_factor in zip(
+                atom_types, atom_positions[i], atom_mask[i], b_factors[i]
+        ):
+          if mask < 0.5:
+            continue
+          element = atom_name[0]  # Protein supports only C, N, O, S, this works.
+          yield modelcif.model.Atom(
+            asym_unit=asym_unit_map[chain_index[i]], type_symbol=element,
+            seq_id=residue_index[i], atom_id=atom_name,
+            x=pos[0], y=pos[1], z=pos[2],
+            het=False, biso=b_factor, occupancy=1.00)
+
+    def add_scores(self):
+      # local scores
+      plldt_per_residue = {}
+      for i in range(n):
+        for mask, b_factor in zip(atom_mask[i], b_factors[i]):
+          if mask < 0.5:
+            continue
+          # add 1 per residue, not 1 per atom
+          if chain_index[i] not in plldt_per_residue:
+            # first time a chain index is seen: add the key and start the residue dict
+            plldt_per_residue[chain_index[i]] = {residue_index[i]: b_factor}
+          if residue_index[i] not in plldt_per_residue[chain_index[i]]:
+            plldt_per_residue[chain_index[i]][residue_index[i]] = b_factor
+      plddts = []
+      for chain_idx in plldt_per_residue:
+        for residue_idx in plldt_per_residue[chain_idx]:
+          plddt = plldt_per_residue[chain_idx][residue_idx]
+          plddts.append(plddt)
+          self.qa_metrics.append(
+            _LocalPLDDT(asym_unit_map[chain_idx].residue(residue_idx), plddt))
+      # global score
+      self.qa_metrics.append((_GlobalPLDDT(np.mean(plddts))))
+
+  # Add the model and modeling protocol to the file and write them out:
+  model = _MyModel(assembly=modeled_assembly, name='Best scoring model')
+  model.add_scores()
+
+  model_group = modelcif.model.ModelGroup([model], name='All models')
+  system.model_groups.append(model_group)
+
+  fh = io.StringIO()
+  modelcif.dumper.write(fh, [system])
+  return fh.getvalue()
+
+
 def ideal_atom_mask(prot: Protein) -> np.ndarray:
   """Computes an ideal atom mask.
 
@@ -276,3 +409,19 @@ def from_prediction(
       residue_index=_maybe_remove_leading_dim(features['residue_index']) + 1,
       chain_index=chain_index,
       b_factors=b_factors)
+
+
+if __name__ == "__main__":
+  # pdb_file = '/Users/jose/Downloads/171l.pdb'
+  # pdb_file = '/home/jose/Downloads/2trx.pdb'
+  pdb_file = '/Users/jose/Downloads/1bwd.pdb'
+  cif_file = '/Users/jose/test-af.cif'
+
+  with open(pdb_file, 'r') as file:
+    pdbstr = file.read()
+
+  prot = from_pdb_string(pdbstr)
+  cifstr = to_modelcif(prot)
+  print(cifstr)
+  with open(cif_file, 'w') as fw:
+    fw.write(cifstr)

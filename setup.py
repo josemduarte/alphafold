@@ -41,6 +41,7 @@ setup(
         'pandas',
         'scipy',
         'tensorflow-cpu',
+        'modelcif',
     ],
     tests_require=[
         'matplotlib',  # For notebook_utils_test.
